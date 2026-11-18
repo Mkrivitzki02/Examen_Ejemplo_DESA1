@@ -2,53 +2,83 @@ package ar.edu.examen.iiot.data
 
 import android.content.Context
 import ar.edu.examen.iiot.model.Reading
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 
-class PlantRepository(private val context: Context) {
-    private val database = PlantDatabase(context)
+/**
+ * Contrato que usa el ViewModel. Permite probar la lógica de pantalla con un
+ * repositorio falso, sin Android, red ni SQLite.
+ */
+interface PlantDataSource {
+    suspend fun localReadings(): List<Reading>
+    suspend fun search(query: String): List<Reading>
+    /** Sincroniza y devuelve el mensaje de estado para mostrar. */
+    suspend fun sync(): String
+    suspend fun history(machineId: String): List<Reading>
+    suspend fun threshold(): Double
+    suspend fun saveThreshold(value: Double)
+}
+
+class PlantRepository(
+    context: Context,
+    private val io: CoroutineDispatcher = Dispatchers.IO
+) : PlantDataSource {
+    // applicationContext: el repositorio vive tanto como el ViewModel y no debe
+    // retener la Activity (que se destruye, por ejemplo, al rotar la pantalla).
+    private val database = PlantDatabase(context.applicationContext)
     private val api = Retrofit.Builder()
         .baseUrl("https://api.thingspeak.com/")
         .addConverterFactory(GsonConverterFactory.create())
         .build()
         .create(ThingSpeakApi::class.java)
 
-    var lastSyncMessage: String = "Datos locales"
-        private set
-
-    fun localReadings(): List<Reading> {
+    override suspend fun localReadings(): List<Reading> = withContext(io) {
         val rows = database.latest()
-        if (rows.isNotEmpty()) return rows
-        sampleReadings(null, null, false).forEach(database::insert)
-        return database.latest()
+        if (rows.isNotEmpty()) return@withContext rows
+        database.insertAll(sampleReadings(null, null, false))
+        database.latest()
     }
 
-    fun search(query: String): List<Reading> =
-        if (query.isBlank()) database.latest() else database.findLatestByName(query)
+    override suspend fun search(query: String): List<Reading> = withContext(io) {
+        if (query.isBlank()) database.latest() else database.findLatestByName(query.trim())
+    }
 
-    suspend fun sync(): List<Reading> {
+    override suspend fun sync(): String = withContext(io) {
         var remoteTemperature: Double? = null
         var remoteHumidity: Double? = null
-        var remoteOk = false
 
-        try {
+        val message = try {
             val feed = api.getLatest().feeds.lastOrNull()
             remoteTemperature = feed?.temperature?.toDoubleOrNull()
                 ?.takeIf { it in -20.0..150.0 }
             remoteHumidity = feed?.humidity?.toDoubleOrNull()
                 ?.takeIf { it in 0.0..100.0 }
-            remoteOk = remoteTemperature != null
-            lastSyncMessage = if (remoteOk) {
+            if (remoteTemperature != null) {
                 "Sincronizado con ThingSpeak (canal público de demostración)"
             } else {
                 "Sin datos remotos válidos: usando datos simulados"
             }
         } catch (exception: Exception) {
-            lastSyncMessage = "Sin conexión a API: usando datos simulados"
+            "Sin conexión a API: usando datos simulados"
         }
 
-        sampleReadings(remoteTemperature, remoteHumidity, remoteOk).forEach(database::insert)
-        return database.latest()
+        database.insertAll(
+            sampleReadings(remoteTemperature, remoteHumidity, remoteTemperature != null)
+        )
+        message
+    }
+
+    override suspend fun history(machineId: String): List<Reading> = withContext(io) {
+        database.history(machineId)
+    }
+
+    override suspend fun threshold(): Double = withContext(io) { database.readThreshold() }
+
+    override suspend fun saveThreshold(value: Double) = withContext(io) {
+        database.saveThreshold(value)
     }
 
     private fun sampleReadings(
@@ -62,7 +92,7 @@ class PlantRepository(private val context: Context) {
             Reading(
                 machineId = "CMP-01",
                 machineName = "Compresor A",
-                temperature = remoteTemperature ?: 56.2 + variation,
+                temperature = remoteTemperature ?: (56.2 + variation),
                 humidity = remoteHumidity ?: 42.0,
                 vibration = 1.6,
                 timestamp = now,

@@ -26,7 +26,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var movement: Float? = null
 
     private val viewModel: PlantViewModel by viewModels {
-        PlantViewModel.Factory(PlantRepository(this))
+        PlantViewModel.Factory(PlantRepository(applicationContext))
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -47,7 +47,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 state = state,
                 onFilterChanged = viewModel::filter,
                 onThresholdClick = viewModel::configureThreshold,
+                onThresholdInputChanged = viewModel::onThresholdInputChanged,
+                onThresholdSave = viewModel::saveThreshold,
+                onThresholdDismiss = viewModel::dismissThresholdEditor,
                 onHistoryClick = viewModel::showHistory,
+                onHistoryDismiss = viewModel::closeHistory,
                 onDismissNotification = viewModel::dismissNotification
             )
         }

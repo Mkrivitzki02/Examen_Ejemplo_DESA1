@@ -5,10 +5,11 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import ar.edu.examen.iiot.model.PlantRules
 import ar.edu.examen.iiot.model.Reading
 
-class PlantDatabase(context: Context) :
-    SQLiteOpenHelper(context, "planta_iiot.db", null, 1) {
+class PlantDatabase(context: Context, name: String? = DATABASE_NAME) :
+    SQLiteOpenHelper(context, name, null, DATABASE_VERSION) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
@@ -26,12 +27,22 @@ class PlantDatabase(context: Context) :
         db.execSQL(
             "CREATE TABLE configuration (config_key TEXT PRIMARY KEY, config_value TEXT NOT NULL)"
         )
+        createIndexes(db)
     }
 
+    /**
+     * Migración incremental: antes se borraban todas las tablas en cada cambio de
+     * versión, perdiendo el historial y la configuración del usuario.
+     */
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS readings")
-        db.execSQL("DROP TABLE IF EXISTS configuration")
-        onCreate(db)
+        if (oldVersion < 2) createIndexes(db)
+    }
+
+    private fun createIndexes(db: SQLiteDatabase) {
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS idx_readings_machine_time " +
+                "ON readings(machine_id, captured_at)"
+        )
     }
 
     fun insert(reading: Reading) {
@@ -47,30 +58,63 @@ class PlantDatabase(context: Context) :
         writableDatabase.insertOrThrow("readings", null, values)
     }
 
-    fun latest(): List<Reading> {
-        val sql = """SELECT r.id, r.machine_id, r.machine_name,
-                   r.temperature, r.humidity, r.vibration, r.captured_at, r.source
-                   FROM readings r
-                   INNER JOIN (
-                       SELECT machine_id, MAX(id) AS latest_id
-                       FROM readings GROUP BY machine_id
-                   ) x ON r.id = x.latest_id
-                   ORDER BY r.machine_name""".trimIndent()
-        return readableDatabase.rawQuery(sql, null).use(::readAll)
+    /** Inserta un lote completo en una sola transacción. */
+    fun insertAll(readings: List<Reading>) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            readings.forEach(::insert)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
+    fun latest(): List<Reading> =
+        readableDatabase.rawQuery("$LATEST_SQL ORDER BY r.machine_name", null).use(::readAll)
+
+    /** El texto del usuario viaja como parámetro (?), nunca concatenado en el SQL. */
     fun findLatestByName(filter: String): List<Reading> {
-        val sql = """SELECT r.id, r.machine_id, r.machine_name,
-                   r.temperature, r.humidity, r.vibration, r.captured_at, r.source
-                   FROM readings r
-                   INNER JOIN (
-                       SELECT machine_id, MAX(id) AS latest_id
-                       FROM readings GROUP BY machine_id
-                   ) x ON r.id = x.latest_id
-                   WHERE r.machine_name LIKE '%$filter%'
-                   ORDER BY r.machine_name""".trimIndent()
-        return readableDatabase.rawQuery(sql, null).use(::readAll)
+        val sql = "$LATEST_SQL WHERE r.machine_name LIKE ? ESCAPE '\\' ORDER BY r.machine_name"
+        val pattern = "%" + escapeLike(filter) + "%"
+        return readableDatabase.rawQuery(sql, arrayOf(pattern)).use(::readAll)
     }
+
+    /** Últimas [limit] lecturas de un equipo, desde la más reciente. */
+    fun history(machineId: String, limit: Int = PlantRules.HISTORY_SIZE): List<Reading> {
+        val sql = """SELECT id, machine_id, machine_name, temperature, humidity,
+                     vibration, captured_at, source
+                     FROM readings
+                     WHERE machine_id = ?
+                     ORDER BY captured_at DESC, id DESC
+                     LIMIT ?""".trimIndent()
+        return readableDatabase.rawQuery(sql, arrayOf(machineId, limit.toString()))
+            .use(::readAll)
+    }
+
+    fun readThreshold(): Double {
+        val stored = readableDatabase.rawQuery(
+            "SELECT config_value FROM configuration WHERE config_key = ?",
+            arrayOf(KEY_THRESHOLD)
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+        return stored?.toDoubleOrNull()
+            ?.takeIf(PlantRules::isValidThreshold)
+            ?: PlantRules.DEFAULT_TEMPERATURE_LIMIT
+    }
+
+    fun saveThreshold(value: Double) {
+        require(PlantRules.isValidThreshold(value)) { "Umbral fuera de rango: $value" }
+        val values = ContentValues().apply {
+            put("config_key", KEY_THRESHOLD)
+            put("config_value", value.toString())
+        }
+        writableDatabase.insertWithOnConflict(
+            "configuration", null, values, SQLiteDatabase.CONFLICT_REPLACE
+        )
+    }
+
+    private fun escapeLike(text: String): String =
+        text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     private fun readAll(cursor: Cursor): List<Reading> {
         val items = mutableListOf<Reading>()
@@ -87,5 +131,19 @@ class PlantDatabase(context: Context) :
             )
         }
         return items
+    }
+
+    companion object {
+        const val DATABASE_NAME = "planta_iiot.db"
+        const val DATABASE_VERSION = 2
+        private const val KEY_THRESHOLD = "temperature_threshold"
+
+        private val LATEST_SQL = """SELECT r.id, r.machine_id, r.machine_name,
+                   r.temperature, r.humidity, r.vibration, r.captured_at, r.source
+                   FROM readings r
+                   INNER JOIN (
+                       SELECT machine_id, MAX(id) AS latest_id
+                       FROM readings GROUP BY machine_id
+                   ) x ON r.id = x.latest_id""".trimIndent()
     }
 }
